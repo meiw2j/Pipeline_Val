@@ -165,15 +165,12 @@ def collect_parquet_column_metadata(
                 )
             states.append(state)
 
-        if include_details or any(state["is_variable_bytes"] for state in states):
+        if include_details:
             for batch in parquet_file.iter_batches(batch_size=65536):
                 for index, state in enumerate(states):
-                    if not include_details and not state["is_variable_bytes"]:
-                        continue
                     values = batch.column(index)
-                    if include_details:
-                        state["n_pop"] += len(values) - values.null_count
-                    if include_details and state["is_numeric"]:
+                    state["n_pop"] += len(values) - values.null_count
+                    if state["is_numeric"]:
                         aggregate = pc.min_max(values)
                         minimum = aggregate["min"].as_py()
                         maximum = aggregate["max"].as_py()
@@ -201,8 +198,7 @@ def collect_parquet_column_metadata(
                             if value is None:
                                 continue
                             state["has_value"] = True
-                            if include_details:
-                                state["distinct"].add(_distinct_key(value))
+                            state["distinct"].add(_distinct_key(value))
                             if state["is_variable_bytes"]:
                                 length = (
                                     len(value.encode("utf-8"))
@@ -217,7 +213,11 @@ def collect_parquet_column_metadata(
         for state in states:
             max_length = state["max_length"]
             if state["is_variable_bytes"]:
-                varlen = max_length if state["has_value"] else None
+                varlen = (
+                    max_length
+                    if include_details and state["has_value"]
+                    else None
+                )
             else:
                 varlen = state["fixed_width"]
 
