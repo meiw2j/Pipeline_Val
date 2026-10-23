@@ -7,17 +7,14 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
-def collect_file_metadata(
-    source: Path, output: Path, additional_outputs: set[Path] | None = None
-) -> list[dict[str, Any]]:
-    """Collect metadata for every file below source, excluding generated outputs."""
-    excluded_outputs = {output.resolve()}
-    if additional_outputs:
-        excluded_outputs.update(path.resolve() for path in additional_outputs)
-    rows: list[dict[str, Any]] = []
+def iter_source_files(source: Path) -> Iterator[Path]:
+    """Yield a source file or all files in a directory tree in sorted order."""
+    if source.is_file():
+        yield source
+        return
 
     def raise_walk_error(error: OSError) -> None:
         raise error
@@ -28,22 +25,34 @@ def collect_file_metadata(
         directories.sort()
         filenames.sort()
         for filename in filenames:
-            file_path = Path(root) / filename
-            if file_path.resolve() in excluded_outputs:
-                continue
+            yield Path(root) / filename
 
-            stat = file_path.stat()
-            rows.append(
-                {
-                    "filename": file_path.name,
-                    "fullpath": str(file_path.resolve()),
-                    "filesize": stat.st_size,
-                    "file extensions": file_path.suffix,
-                    "modified_time": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ),
-                }
-            )
+
+def collect_file_metadata(
+    source: Path, output: Path, additional_outputs: set[Path] | None = None
+) -> list[dict[str, Any]]:
+    """Collect metadata for the source file or directory tree."""
+    excluded_outputs = {output.resolve()}
+    if additional_outputs:
+        excluded_outputs.update(path.resolve() for path in additional_outputs)
+    rows: list[dict[str, Any]] = []
+
+    for file_path in iter_source_files(source):
+        if file_path.resolve() in excluded_outputs:
+            continue
+
+        stat = file_path.stat()
+        rows.append(
+            {
+                "filename": file_path.name,
+                "fullpath": str(file_path.resolve()),
+                "filesize": stat.st_size,
+                "file extensions": file_path.suffix,
+                "modified_time": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ),
+            }
+        )
 
     return rows
 
@@ -57,41 +66,32 @@ def collect_parquet_table_metadata(
 
     rows: list[dict[str, Any]] = []
 
-    def raise_walk_error(error: OSError) -> None:
-        raise error
+    for file_path in iter_source_files(source):
+        if file_path.suffix.lower() != ".parquet":
+            continue
+        resolved_path = file_path.resolve()
+        if resolved_path in excluded_outputs:
+            continue
 
-    for root, directories, filenames in os.walk(
-        source, onerror=raise_walk_error, followlinks=False
-    ):
-        directories.sort()
-        filenames.sort()
-        for filename in filenames:
-            file_path = Path(root) / filename
-            if file_path.suffix.lower() != ".parquet":
-                continue
-            resolved_path = file_path.resolve()
-            if resolved_path in excluded_outputs:
-                continue
+        try:
+            stat = file_path.stat()
+            metadata = pq.ParquetFile(file_path).metadata
+        except (OSError, pa.ArrowException) as error:
+            raise RuntimeError(
+                f"Could not read Parquet metadata from {file_path}: {error}"
+            ) from error
 
-            try:
-                stat = file_path.stat()
-                metadata = pq.ParquetFile(file_path).metadata
-            except (OSError, pa.ArrowException) as error:
-                raise RuntimeError(
-                    f"Could not read Parquet metadata from {file_path}: {error}"
-                ) from error
-
-            rows.append(
-                {
-                    "table_name": file_path.stem,
-                    "table_size": stat.st_size,
-                    "NOBS": metadata.num_rows,
-                    "NVARS": metadata.num_columns,
-                    "modified_time": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ),
-                }
-            )
+        rows.append(
+            {
+                "table_name": file_path.stem,
+                "table_size": stat.st_size,
+                "NOBS": metadata.num_rows,
+                "NVARS": metadata.num_columns,
+                "modified_time": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ),
+            }
+        )
 
     return rows
 
@@ -145,7 +145,7 @@ def main() -> int:
     parser.add_argument(
         "source",
         type=Path,
-        help="Directory to scan (for example, /data002/eds/data/prod/raw_files/P2026W38)",
+        help="Parquet file or directory to scan",
     )
     parser.add_argument(
         "-o",
@@ -166,11 +166,15 @@ def main() -> int:
     output = args.output.expanduser().resolve()
     table_output = args.table_output.expanduser().resolve()
     if not source.exists():
-        parser.error(f"source directory does not exist: {source}")
-    if not source.is_dir():
-        parser.error(f"source is not a directory: {source}")
+        parser.error(f"source does not exist: {source}")
+    if not source.is_dir() and not source.is_file():
+        parser.error(f"source is not a regular file or directory: {source}")
+    if source.is_file() and source.suffix.lower() != ".parquet":
+        parser.error(f"source file is not a Parquet file: {source}")
     if output == table_output:
         parser.error("--output and --table-output must be different files")
+    if source.is_file() and source in {output, table_output}:
+        parser.error("output files must not overwrite the source Parquet file")
 
     try:
         generated_outputs = {output, table_output}
