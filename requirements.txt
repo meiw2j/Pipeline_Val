@@ -1,0 +1,2 @@
+pyarrow>=14.0
+tzdata>=2024.1
