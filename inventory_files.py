@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import datetime, timezone
@@ -97,12 +96,6 @@ def collect_parquet_table_metadata(
     return rows
 
 
-def _distinct_key(value: Any) -> str:
-    if isinstance(value, float) and value != value:
-        return "float:nan"
-    return f"{type(value).__name__}:{json.dumps(value, sort_keys=True, default=str)}"
-
-
 def _fixed_width_bytes(data_type: Any) -> int | None:
     import pyarrow as pa
 
@@ -124,143 +117,150 @@ def collect_parquet_column_metadata(
 ) -> list[dict[str, Any]]:
     """Collect basic column metadata and optionally detailed statistics."""
     import pyarrow as pa
-    import pyarrow.compute as pc
     import pyarrow.parquet as pq
 
     try:
         parquet_file = pq.ParquetFile(source)
         schema = parquet_file.schema_arrow
-        nobs = parquet_file.metadata.num_rows
-        states: list[dict[str, Any]] = []
-        for field in schema:
-            data_type = field.type
-            is_numeric = (
-                pa.types.is_integer(data_type)
-                or pa.types.is_floating(data_type)
-                or pa.types.is_decimal(data_type)
-            )
-            is_variable_bytes = (
-                pa.types.is_string(data_type)
-                or pa.types.is_large_string(data_type)
-                or pa.types.is_binary(data_type)
-                or pa.types.is_large_binary(data_type)
-            )
-            state: dict[str, Any] = {
-                "field": field,
-                "is_numeric": is_numeric,
-                "max_length": 0,
-                "has_value": False,
-                "fixed_width": _fixed_width_bytes(data_type),
-                "is_variable_bytes": is_variable_bytes,
+        rows = [
+            {
+                "Varname": field.name,
+                "Vartype": str(field.type),
+                "Varlen": _fixed_width_bytes(field.type),
             }
-            if include_details:
-                state.update(
-                    {
-                        "n_pop": 0,
-                        "distinct": set(),
-                        "min": None,
-                        "max": None,
-                        "sum": None,
-                    }
-                )
-            states.append(state)
-
+            for field in schema
+        ]
         if include_details:
-            for batch in parquet_file.iter_batches(batch_size=65536):
-                for index, state in enumerate(states):
-                    values = batch.column(index)
-                    state["n_pop"] += len(values) - values.null_count
-                    if state["is_numeric"]:
-                        aggregate = pc.min_max(values)
-                        minimum = aggregate["min"].as_py()
-                        maximum = aggregate["max"].as_py()
-                        total = pc.sum(values).as_py()
-                        if minimum is not None:
-                            state["min"] = (
-                                minimum
-                                if state["min"] is None
-                                else min(state["min"], minimum)
-                            )
-                            state["max"] = (
-                                maximum
-                                if state["max"] is None
-                                else max(state["max"], maximum)
-                            )
-                        if total is not None:
-                            state["sum"] = (
-                                total
-                                if state["sum"] is None
-                                else state["sum"] + total
-                            )
-                    else:
-                        for scalar in values:
-                            value = scalar.as_py()
-                            if value is None:
-                                continue
-                            state["has_value"] = True
-                            state["distinct"].add(_distinct_key(value))
-                            if state["is_variable_bytes"]:
-                                length = (
-                                    len(value.encode("utf-8"))
-                                    if isinstance(value, str)
-                                    else len(value)
-                                )
-                                state["max_length"] = max(
-                                    state["max_length"], length
-                                )
-
-        rows: list[dict[str, Any]] = []
-        for state in states:
-            max_length = state["max_length"]
-            if state["is_variable_bytes"]:
-                varlen = (
-                    max_length
-                    if include_details and state["has_value"]
-                    else None
-                )
-            else:
-                varlen = state["fixed_width"]
-
-            row = {
-                "Varname": state["field"].name,
-                "Vartype": str(state["field"].type),
-                "Varlen": varlen,
-            }
-            if include_details:
-                n_pop = state["n_pop"]
-                row.update(
-                    {
-                        "N_Pop": n_pop,
-                        "N_Missing": nobs - n_pop,
-                        "Pop_Rate": n_pop / nobs if nobs else None,
-                        "N_Distinct": (
-                            None
-                            if state["is_numeric"]
-                            else len(state["distinct"])
-                        ),
-                        "Min": (
-                            float(state["min"])
-                            if state["min"] is not None
-                            else None
-                        ),
-                        "Max": (
-                            float(state["max"])
-                            if state["max"] is not None
-                            else None
-                        ),
-                        "Sum": (
-                            float(state["sum"])
-                            if state["sum"] is not None
-                            else None
-                        ),
-                    }
-                )
-            rows.append(row)
+            statistics = _collect_column_statistics_with_spark(
+                source, [field.name for field in schema]
+            )
+            for row, stats in zip(rows, statistics):
+                row.update(stats)
         return rows
     except (OSError, pa.ArrowException) as error:
         raise RuntimeError(
             f"Could not calculate column metadata from {source}: {error}"
         ) from error
+
+
+def _collect_column_statistics_with_spark(
+    source: Path, column_names: list[str]
+) -> list[dict[str, Any]]:
+    try:
+        from py4j.protocol import Py4JError
+        from pyspark.errors import PySparkException
+        from pyspark.sql import SparkSession, functions as F
+        from pyspark.sql.types import (
+            ArrayType,
+            BinaryType,
+            MapType,
+            NumericType,
+            StringType,
+            StructType,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Detailed column statistics require PySpark. Install it with "
+            "'python -m pip install -r requirements.txt' and use a compatible "
+            "Java runtime."
+        ) from error
+
+    owns_session = (
+        SparkSession.getActiveSession() is None
+        and SparkSession.getDefaultSession() is None
+    )
+    try:
+        builder = SparkSession.builder.appName("ParquetColumnInventory")
+        master = os.environ.get("SPARK_MASTER")
+        if master:
+            builder = builder.master(master)
+        elif not os.environ.get("SPARK_HOME"):
+            builder = builder.master("local[*]")
+        spark = builder.getOrCreate()
+        spark.sparkContext.setLogLevel("WARN")
+        dataframe = spark.read.parquet(str(source))
+        if [field.name for field in dataframe.schema.fields] != column_names:
+            raise RuntimeError(
+                "Spark and Parquet schemas contain different column names or order"
+            )
+
+        expressions = [F.count(F.lit(1)).alias("__nobs")]
+        column_aliases: list[dict[str, str | None]] = []
+        for index, field in enumerate(dataframe.schema.fields):
+            quoted_name = f"`{field.name.replace('`', '``')}`"
+            column = F.col(quoted_name)
+            is_numeric = isinstance(field.dataType, NumericType)
+            n_pop_alias = f"__c{index}_n_pop"
+            aliases = {"n_pop": n_pop_alias}
+            expressions.append(F.count(column).alias(n_pop_alias))
+
+            if is_numeric:
+                aliases.update(
+                    {
+                        "min": f"__c{index}_min",
+                        "max": f"__c{index}_max",
+                        "sum": f"__c{index}_sum",
+                    }
+                )
+                expressions.extend(
+                    [
+                        F.min(column).alias(aliases["min"]),
+                        F.max(column).alias(aliases["max"]),
+                        F.sum(column).alias(aliases["sum"]),
+                    ]
+                )
+            else:
+                aliases["distinct"] = f"__c{index}_distinct"
+                distinct_column = column
+                if isinstance(field.dataType, (ArrayType, MapType, StructType)):
+                    distinct_column = F.to_json(column)
+                expressions.append(
+                    F.countDistinct(distinct_column).alias(aliases["distinct"])
+                )
+
+            if isinstance(field.dataType, StringType):
+                byte_length = F.length(F.encode(column, "UTF-8"))
+                aliases["varlen"] = f"__c{index}_varlen"
+                expressions.append(
+                    F.max(byte_length).alias(aliases["varlen"])
+                )
+            elif isinstance(field.dataType, BinaryType):
+                aliases["varlen"] = f"__c{index}_varlen"
+                expressions.append(
+                    F.max(F.length(column)).alias(aliases["varlen"])
+                )
+            column_aliases.append(aliases)
+
+        aggregate_row = dataframe.agg(*expressions).first()
+        aggregate_values = aggregate_row.asDict()
+        nobs = aggregate_values["__nobs"]
+        statistics: list[dict[str, Any]] = []
+        for aliases in column_aliases:
+            n_pop = aggregate_values[aliases["n_pop"]]
+            varlen = aggregate_values.get(aliases.get("varlen", ""))
+            distinct = aggregate_values.get(aliases.get("distinct", ""))
+            minimum = aggregate_values.get(aliases.get("min", ""))
+            maximum = aggregate_values.get(aliases.get("max", ""))
+            total = aggregate_values.get(aliases.get("sum", ""))
+            result: dict[str, Any] = {
+                "Varlen": varlen,
+                "N_Pop": n_pop,
+                "N_Missing": nobs - n_pop,
+                "Pop_Rate": n_pop / nobs if nobs else None,
+                "N_Distinct": distinct,
+                "Min": float(minimum) if minimum is not None else None,
+                "Max": float(maximum) if maximum is not None else None,
+                "Sum": float(total) if total is not None else None,
+            }
+            statistics.append(result)
+        return statistics
+    except (OSError, Py4JError, PySparkException) as error:
+        raise RuntimeError(
+            f"Spark could not calculate column statistics from {source}: {error}"
+        ) from error
+    finally:
+        if owns_session and "spark" in locals():
+            spark.stop()
 
 
 def write_parquet(rows: list[dict[str, Any]], output: Path) -> None:
@@ -366,7 +366,7 @@ def main() -> int:
     parser.add_argument(
         "--column-detail-output",
         type=Path,
-        help="Detailed column statistics output "
+        help="Detailed column statistics output (requires PySpark and Java 17+) "
         "(default: ./parquet_column_detail_inventory.parquet)",
     )
     parser.add_argument(
