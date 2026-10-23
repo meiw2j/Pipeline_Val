@@ -119,8 +119,10 @@ def _fixed_width_bytes(data_type: Any) -> int | None:
     return None
 
 
-def collect_parquet_column_metadata(source: Path) -> list[dict[str, Any]]:
-    """Calculate null, distinct, length, and numeric statistics per column."""
+def collect_parquet_column_metadata(
+    source: Path, include_details: bool = False
+) -> list[dict[str, Any]]:
+    """Collect basic column metadata and optionally detailed statistics."""
     import pyarrow as pa
     import pyarrow.compute as pc
     import pyarrow.parquet as pq
@@ -143,90 +145,117 @@ def collect_parquet_column_metadata(source: Path) -> list[dict[str, Any]]:
                 or pa.types.is_binary(data_type)
                 or pa.types.is_large_binary(data_type)
             )
-            states.append(
-                {
-                    "field": field,
-                    "is_numeric": is_numeric,
-                    "n_pop": 0,
-                    "max_length": 0,
-                    "distinct": set(),
-                    "min": None,
-                    "max": None,
-                    "sum": None,
-                    "fixed_width": _fixed_width_bytes(data_type),
-                    "is_variable_bytes": is_variable_bytes,
-                }
-            )
+            state: dict[str, Any] = {
+                "field": field,
+                "is_numeric": is_numeric,
+                "max_length": 0,
+                "has_value": False,
+                "fixed_width": _fixed_width_bytes(data_type),
+                "is_variable_bytes": is_variable_bytes,
+            }
+            if include_details:
+                state.update(
+                    {
+                        "n_pop": 0,
+                        "distinct": set(),
+                        "min": None,
+                        "max": None,
+                        "sum": None,
+                    }
+                )
+            states.append(state)
 
-        for batch in parquet_file.iter_batches(batch_size=65536):
-            for index, state in enumerate(states):
-                values = batch.column(index)
-                state["n_pop"] += len(values) - values.null_count
-                if state["is_numeric"]:
-                    aggregate = pc.min_max(values)
-                    minimum = aggregate["min"].as_py()
-                    maximum = aggregate["max"].as_py()
-                    total = pc.sum(values).as_py()
-                    if minimum is not None:
-                        state["min"] = (
-                            minimum
-                            if state["min"] is None
-                            else min(state["min"], minimum)
-                        )
-                        state["max"] = (
-                            maximum
-                            if state["max"] is None
-                            else max(state["max"], maximum)
-                        )
-                    if total is not None:
-                        state["sum"] = (
-                            total if state["sum"] is None else state["sum"] + total
-                        )
-                else:
-                    for scalar in values:
-                        value = scalar.as_py()
-                        if value is None:
-                            continue
-                        state["distinct"].add(_distinct_key(value))
-                        if state["is_variable_bytes"]:
-                            length = (
-                                len(value.encode("utf-8"))
-                                if isinstance(value, str)
-                                else len(value)
+        if include_details or any(state["is_variable_bytes"] for state in states):
+            for batch in parquet_file.iter_batches(batch_size=65536):
+                for index, state in enumerate(states):
+                    if not include_details and not state["is_variable_bytes"]:
+                        continue
+                    values = batch.column(index)
+                    if include_details:
+                        state["n_pop"] += len(values) - values.null_count
+                    if include_details and state["is_numeric"]:
+                        aggregate = pc.min_max(values)
+                        minimum = aggregate["min"].as_py()
+                        maximum = aggregate["max"].as_py()
+                        total = pc.sum(values).as_py()
+                        if minimum is not None:
+                            state["min"] = (
+                                minimum
+                                if state["min"] is None
+                                else min(state["min"], minimum)
                             )
-                            state["max_length"] = max(
-                                state["max_length"], length
+                            state["max"] = (
+                                maximum
+                                if state["max"] is None
+                                else max(state["max"], maximum)
                             )
+                        if total is not None:
+                            state["sum"] = (
+                                total
+                                if state["sum"] is None
+                                else state["sum"] + total
+                            )
+                    else:
+                        for scalar in values:
+                            value = scalar.as_py()
+                            if value is None:
+                                continue
+                            state["has_value"] = True
+                            if include_details:
+                                state["distinct"].add(_distinct_key(value))
+                            if state["is_variable_bytes"]:
+                                length = (
+                                    len(value.encode("utf-8"))
+                                    if isinstance(value, str)
+                                    else len(value)
+                                )
+                                state["max_length"] = max(
+                                    state["max_length"], length
+                                )
 
         rows: list[dict[str, Any]] = []
         for state in states:
-            n_pop = state["n_pop"]
             max_length = state["max_length"]
-            if state["is_variable_bytes"] and n_pop == 0:
-                varlen = None
-            elif state["is_variable_bytes"]:
-                varlen = max_length
+            if state["is_variable_bytes"]:
+                varlen = max_length if state["has_value"] else None
             else:
                 varlen = state["fixed_width"]
 
-            rows.append(
-                {
-                    "Varname": state["field"].name,
-                    "Vartype": str(state["field"].type),
-                    "Varlen": varlen,
-                    "N_Pop": n_pop,
-                    "N_Missing": nobs - n_pop,
-                    "Pop_Rate": n_pop / nobs if nobs else None,
-                    "N_Distinct": (
-                        None
-                        if state["is_numeric"]
-                        else len(state["distinct"])
-                    ),
-                    "Min": float(state["min"]) if state["min"] is not None else None,
-                    "Max": float(state["max"]) if state["max"] is not None else None,
-                    "Sum": float(state["sum"]) if state["sum"] is not None else None,
-                }
-            )
+            row = {
+                "Varname": state["field"].name,
+                "Vartype": str(state["field"].type),
+                "Varlen": varlen,
+            }
+            if include_details:
+                n_pop = state["n_pop"]
+                row.update(
+                    {
+                        "N_Pop": n_pop,
+                        "N_Missing": nobs - n_pop,
+                        "Pop_Rate": n_pop / nobs if nobs else None,
+                        "N_Distinct": (
+                            None
+                            if state["is_numeric"]
+                            else len(state["distinct"])
+                        ),
+                        "Min": (
+                            float(state["min"])
+                            if state["min"] is not None
+                            else None
+                        ),
+                        "Max": (
+                            float(state["max"])
+                            if state["max"] is not None
+                            else None
+                        ),
+                        "Sum": (
+                            float(state["sum"])
+                            if state["sum"] is not None
+                            else None
+                        ),
+                    }
+                )
+            rows.append(row)
         return rows
     except (OSError, pa.ArrowException) as error:
         raise RuntimeError(
@@ -276,24 +305,30 @@ def write_table_metadata(rows: list[dict[str, Any]], output: Path) -> None:
     pq.write_table(table, output)
 
 
-def write_column_metadata(rows: list[dict[str, Any]], output: Path) -> None:
+def write_column_metadata(
+    rows: list[dict[str, Any]], output: Path, include_details: bool = False
+) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    schema = pa.schema(
-        [
-            ("Varname", pa.string()),
-            ("Vartype", pa.string()),
-            ("Varlen", pa.int64()),
-            ("N_Pop", pa.int64()),
-            ("N_Missing", pa.int64()),
-            ("Pop_Rate", pa.float64()),
-            ("N_Distinct", pa.int64()),
-            ("Min", pa.float64()),
-            ("Max", pa.float64()),
-            ("Sum", pa.float64()),
-        ]
-    )
+    fields = [
+        ("Varname", pa.string()),
+        ("Vartype", pa.string()),
+        ("Varlen", pa.int64()),
+    ]
+    if include_details:
+        fields.extend(
+            [
+                ("N_Pop", pa.int64()),
+                ("N_Missing", pa.int64()),
+                ("Pop_Rate", pa.float64()),
+                ("N_Distinct", pa.int64()),
+                ("Min", pa.float64()),
+                ("Max", pa.float64()),
+                ("Sum", pa.float64()),
+            ]
+        )
+    schema = pa.schema(fields)
     table = pa.Table.from_pylist(rows, schema=schema)
     output.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, output)
@@ -329,11 +364,18 @@ def main() -> int:
         "(default: ./parquet_column_inventory.parquet)",
     )
     parser.add_argument(
+        "--column-detail-output",
+        type=Path,
+        help="Detailed column statistics output "
+        "(default: ./parquet_column_detail_inventory.parquet)",
+    )
+    parser.add_argument(
         "--outputs",
         nargs="+",
-        choices=("file", "table", "column", "all"),
-        help="Outputs to generate: file, table, column, or all "
-        "(default: all outputs supported by the input)",
+        choices=("file", "table", "column", "column-detail", "all"),
+        help="Outputs to generate: file, table, column, column-detail, or all. "
+        "The default/all includes basic column metadata; detailed statistics "
+        "require column-detail or an explicit --column-detail-output path.",
     )
     args = parser.parse_args()
 
@@ -347,10 +389,19 @@ def main() -> int:
         if source.is_file()
         else None
     )
+    column_detail_output = (
+        args.column_detail_output.expanduser().resolve()
+        if args.column_detail_output
+        else Path("parquet_column_detail_inventory.parquet").resolve()
+        if source.is_file()
+        else None
+    )
     if args.outputs is None or args.outputs == ["all"]:
         selected_outputs = {"file", "table"}
         if source.is_file():
             selected_outputs.add("column")
+            if args.outputs is None and args.column_detail_output is not None:
+                selected_outputs.add("column-detail")
     elif "all" in args.outputs:
         parser.error("'all' cannot be combined with specific output names")
     else:
@@ -364,13 +415,16 @@ def main() -> int:
         parser.error(f"source file is not a Parquet file: {source}")
     if args.column_output is not None and not source.is_file():
         parser.error("--column-output requires a single Parquet file input")
-    if "column" in selected_outputs and not source.is_file():
-        parser.error("--column output requires a single Parquet file input")
+    if args.column_detail_output is not None and not source.is_file():
+        parser.error("--column-detail-output requires a single Parquet file input")
+    if {"column", "column-detail"} & selected_outputs and not source.is_file():
+        parser.error("column outputs require a single Parquet file input")
 
     output_paths = {
         "file": output,
         "table": table_output,
         "column": column_output,
+        "column-detail": column_detail_output,
     }
     selected_paths = [
         output_paths[name] for name in selected_outputs if output_paths[name] is not None
@@ -383,7 +437,7 @@ def main() -> int:
     try:
         excluded_outputs = {
             path
-            for path in (output, table_output, column_output)
+            for path in (output, table_output, column_output, column_detail_output)
             if path is not None
         }
         if "file" in selected_outputs:
@@ -401,6 +455,16 @@ def main() -> int:
             assert column_output is not None
             write_column_metadata(column_rows, column_output)
             print(f"Wrote {len(column_rows)} column records to {column_output}")
+        if "column-detail" in selected_outputs:
+            detail_rows = collect_parquet_column_metadata(
+                source, include_details=True
+            )
+            assert column_detail_output is not None
+            write_column_metadata(detail_rows, column_detail_output, include_details=True)
+            print(
+                f"Wrote {len(detail_rows)} detailed column records "
+                f"to {column_detail_output}"
+            )
     except (OSError, RuntimeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
