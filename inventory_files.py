@@ -122,6 +122,7 @@ def collect_parquet_column_metadata(
     try:
         parquet_file = pq.ParquetFile(source)
         schema = parquet_file.schema_arrow
+        parquet_file.close()
         rows = [
             {
                 "Varname": field.name,
@@ -131,9 +132,7 @@ def collect_parquet_column_metadata(
             for field in schema
         ]
         if include_details:
-            statistics = _collect_column_statistics_with_spark(
-                source, [field.name for field in schema]
-            )
+            statistics = _collect_column_statistics_with_duckdb(source, schema)
             for row, stats in zip(rows, statistics):
                 row.update(stats)
         return rows
@@ -143,96 +142,89 @@ def collect_parquet_column_metadata(
         ) from error
 
 
-def _collect_column_statistics_with_spark(
-    source: Path, column_names: list[str]
+def _collect_column_statistics_with_duckdb(
+    source: Path, schema: Any
 ) -> list[dict[str, Any]]:
     try:
-        from py4j.protocol import Py4JError
-        from pyspark.errors import PySparkException
-        from pyspark.sql import SparkSession, functions as F
-        from pyspark.sql.types import (
-            ArrayType,
-            BinaryType,
-            MapType,
-            NumericType,
-            StringType,
-            StructType,
-        )
+        import duckdb
+        import pyarrow as pa
     except ImportError as error:
         raise RuntimeError(
-            "Detailed column statistics require PySpark. Install it with "
-            "'python -m pip install -r requirements.txt' and use a compatible "
-            "Java runtime."
+            "Detailed column statistics require DuckDB and PyArrow. Install them with "
+            "'python -m pip install -r requirements.txt'."
         ) from error
 
-    owns_session = (
-        SparkSession.getActiveSession() is None
-        and SparkSession.getDefaultSession() is None
-    )
-    try:
-        builder = SparkSession.builder.appName("ParquetColumnInventory")
-        master = os.environ.get("SPARK_MASTER")
-        if master:
-            builder = builder.master(master)
-        elif not os.environ.get("SPARK_HOME"):
-            builder = builder.master("local[*]")
-        spark = builder.getOrCreate()
-        spark.sparkContext.setLogLevel("WARN")
-        dataframe = spark.read.parquet(str(source))
-        if [field.name for field in dataframe.schema.fields] != column_names:
-            raise RuntimeError(
-                "Spark and Parquet schemas contain different column names or order"
+    expressions = ["count(*) AS __nobs"]
+    column_aliases: list[dict[str, str | None]] = []
+    for index, field in enumerate(schema):
+        column_name = '"' + field.name.replace('"', '""') + '"'
+        data_type = field.type
+        is_numeric = (
+            pa.types.is_integer(data_type)
+            or pa.types.is_floating(data_type)
+            or pa.types.is_decimal(data_type)
+        )
+        aliases: dict[str, str | None] = {
+            "n_pop": f"__c{index}_n_pop",
+            "distinct": None,
+            "min": None,
+            "max": None,
+            "sum": None,
+            "varlen": None,
+        }
+        expressions.append(
+            f"count({column_name}) AS {aliases['n_pop']}"
+        )
+
+        if is_numeric:
+            aliases.update(
+                {
+                    "min": f"__c{index}_min",
+                    "max": f"__c{index}_max",
+                    "sum": f"__c{index}_sum",
+                }
+            )
+            expressions.extend(
+                [
+                    f"min({column_name}) AS {aliases['min']}",
+                    f"max({column_name}) AS {aliases['max']}",
+                    f"sum({column_name}) AS {aliases['sum']}",
+                ]
+            )
+        else:
+            aliases["distinct"] = f"__c{index}_distinct"
+            expressions.append(
+                f"count(DISTINCT {column_name}) AS {aliases['distinct']}"
             )
 
-        expressions = [F.count(F.lit(1)).alias("__nobs")]
-        column_aliases: list[dict[str, str | None]] = []
-        for index, field in enumerate(dataframe.schema.fields):
-            quoted_name = f"`{field.name.replace('`', '``')}`"
-            column = F.col(quoted_name)
-            is_numeric = isinstance(field.dataType, NumericType)
-            n_pop_alias = f"__c{index}_n_pop"
-            aliases = {"n_pop": n_pop_alias}
-            expressions.append(F.count(column).alias(n_pop_alias))
+        if pa.types.is_string(data_type) or pa.types.is_large_string(data_type):
+            aliases["varlen"] = f"__c{index}_varlen"
+            expressions.append(
+                f"max(strlen({column_name})) AS {aliases['varlen']}"
+            )
+        elif (
+            pa.types.is_binary(data_type)
+            or pa.types.is_large_binary(data_type)
+            or pa.types.is_fixed_size_binary(data_type)
+        ):
+            aliases["varlen"] = f"__c{index}_varlen"
+            expressions.append(
+                f"max(octet_length({column_name})) AS {aliases['varlen']}"
+            )
+        column_aliases.append(aliases)
 
-            if is_numeric:
-                aliases.update(
-                    {
-                        "min": f"__c{index}_min",
-                        "max": f"__c{index}_max",
-                        "sum": f"__c{index}_sum",
-                    }
-                )
-                expressions.extend(
-                    [
-                        F.min(column).alias(aliases["min"]),
-                        F.max(column).alias(aliases["max"]),
-                        F.sum(column).alias(aliases["sum"]),
-                    ]
-                )
-            else:
-                aliases["distinct"] = f"__c{index}_distinct"
-                distinct_column = column
-                if isinstance(field.dataType, (ArrayType, MapType, StructType)):
-                    distinct_column = F.to_json(column)
-                expressions.append(
-                    F.countDistinct(distinct_column).alias(aliases["distinct"])
-                )
-
-            if isinstance(field.dataType, StringType):
-                byte_length = F.length(F.encode(column, "UTF-8"))
-                aliases["varlen"] = f"__c{index}_varlen"
-                expressions.append(
-                    F.max(byte_length).alias(aliases["varlen"])
-                )
-            elif isinstance(field.dataType, BinaryType):
-                aliases["varlen"] = f"__c{index}_varlen"
-                expressions.append(
-                    F.max(F.length(column)).alias(aliases["varlen"])
-                )
-            column_aliases.append(aliases)
-
-        aggregate_row = dataframe.agg(*expressions).first()
-        aggregate_values = aggregate_row.asDict()
+    connection = None
+    try:
+        connection = duckdb.connect(database=":memory:")
+        query = (
+            "SELECT "
+            + ", ".join(expressions)
+            + " FROM read_parquet(?)"
+        )
+        cursor = connection.execute(query, [str(source)])
+        aggregate_values = dict(
+            zip((description[0] for description in cursor.description), cursor.fetchone())
+        )
         nobs = aggregate_values["__nobs"]
         statistics: list[dict[str, Any]] = []
         for aliases in column_aliases:
@@ -254,13 +246,13 @@ def _collect_column_statistics_with_spark(
             }
             statistics.append(result)
         return statistics
-    except (OSError, Py4JError, PySparkException) as error:
+    except duckdb.Error as error:
         raise RuntimeError(
-            f"Spark could not calculate column statistics from {source}: {error}"
+            f"DuckDB could not calculate column statistics from {source}: {error}"
         ) from error
     finally:
-        if owns_session and "spark" in locals():
-            spark.stop()
+        if connection is not None:
+            connection.close()
 
 
 def write_parquet(rows: list[dict[str, Any]], output: Path) -> None:
@@ -366,7 +358,7 @@ def main() -> int:
     parser.add_argument(
         "--column-detail-output",
         type=Path,
-        help="Detailed column statistics output (requires PySpark and Java 17+) "
+        help="Detailed column statistics output (requires DuckDB) "
         "(default: ./parquet_column_detail_inventory.parquet)",
     )
     parser.add_argument(
@@ -375,7 +367,8 @@ def main() -> int:
         choices=("file", "table", "column", "column-detail", "all"),
         help="Outputs to generate: file, table, column, column-detail, or all. "
         "The default/all includes basic column metadata; detailed statistics "
-        "require column-detail or an explicit --column-detail-output path.",
+        "require column-detail or an explicit --column-detail-output path "
+        "and DuckDB.",
     )
     args = parser.parse_args()
 
